@@ -27,6 +27,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -35,7 +36,18 @@ import requests
 import json
 import warnings
 
+import growth_engine as ge
+import growth_data as gd
+
 warnings.filterwarnings("ignore")
+
+# Make every plotly_dark figure blend with the dark app background regardless of the
+# deploy environment. On Streamlit Cloud the Streamlit chart theme can otherwise
+# re-skin charts to a light palette; we pair this with theme=None on each chart.
+pio.templates["plotly_dark"].layout.paper_bgcolor = "rgba(0,0,0,0)"
+pio.templates["plotly_dark"].layout.plot_bgcolor = "rgba(0,0,0,0)"
+pio.templates["plotly_dark"].layout.font.color = "#e6e6e6"
+pio.templates.default = "plotly_dark"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -1194,7 +1206,7 @@ def resample_ohlc(df, interval):
 
 view_mode = st.segmented_control(
     "View mode",
-    ["📊 Single", "⚖️ Compare", "🔁 Market"],
+    ["📊 Single", "⚖️ Compare", "🔁 Market", "📈 Growth"],
     default="📊 Single",
     label_visibility="collapsed",
 )
@@ -1273,7 +1285,7 @@ if view_mode and "Compare" in view_mode:
     )
     perf_fig.update_xaxes(showgrid=False)
     perf_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-    st.plotly_chart(perf_fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(perf_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
     st.caption(
         "Both indices rebased to 100 at the start of the selected range — this compares "
         "**% performance**, not absolute levels."
@@ -1416,7 +1428,7 @@ if view_mode and "Market" in view_mode:
         )
         rot_fig.update_xaxes(showgrid=False)
         rot_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(rot_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(rot_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
         st.caption(
             f"All segments rebased to 100 at the start of the **{mkt_range}** window "
             f"({norm.index[0].strftime('%b %d, %Y')}). Smallcap uses the HDFC Smallcap 250 "
@@ -1445,7 +1457,7 @@ if view_mode and "Market" in view_mode:
             rs_fig.update_xaxes(showgrid=False)
             rs_fig.update_yaxes(showgrid=True, gridcolor="#232733")
             st.markdown("#### Relative Strength vs Largecap")
-            st.plotly_chart(rs_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(rs_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
             st.caption("Above 100 = the segment has outperformed largecaps since the window start (money rotating into it).")
 
         # Leadership read for the window
@@ -1494,7 +1506,7 @@ if view_mode and "Market" in view_mode:
         )
         flow_fig.update_xaxes(showgrid=False)
         flow_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(flow_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(flow_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
         st.caption(
             f"Cash-market provisional figures for **{as_of}** (source: NSE). "
             "Only the latest trading day is published free — no historical series."
@@ -1573,6 +1585,156 @@ if view_mode and "Market" in view_mode:
                             file_name="sector_valuation.csv", mime="text/csv", use_container_width=True)
         sx2.download_button("⬇️ Sector table (JSON)", data=sec_json,
                             file_name="sector_valuation.json", mime="application/json", use_container_width=True)
+
+    st.stop()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  GROWTH VIEW — index/sector fundamental growth (aggregate constituents)
+# ═══════════════════════════════════════════════════════════════════════════
+if view_mode and "Growth" in view_mode:
+    st.markdown("### 📈 Growth Metrics — index & sector fundamentals")
+    src_badge("yfinance (constituent financials) · NSE (constituents)")
+
+    g_names = [n for n in ALL_NAMES if gd.has_constituents(INDEX_BY_NAME[n][2])]
+    cur_name = st.session_state.selected_index[0]
+    g_default = cur_name if cur_name in g_names else (g_names[0] if g_names else None)
+    gname = st.selectbox("Index / sector", g_names,
+                         index=(g_names.index(g_default) if g_default in g_names else 0),
+                         key="growth_idx")
+    g_ni = INDEX_BY_NAME[gname][2]
+    constituents = gd.fetch_constituents(g_ni)
+    n_con = len(constituents)
+    st.caption(
+        f"Aggregates the **{n_con} constituents** of {gname} — sums each metric across "
+        f"companies per period, then computes growth (never averages percentages). "
+        f"First build fetches every constituent's statements"
+        + (" — this is large, expect a minute+." if n_con > 120 else " (cached 24h).")
+    )
+
+    if st.button("📈 Build / refresh growth metrics", key="build_growth"):
+        st.session_state["_growth_built"] = gname
+
+    if st.session_state.get("_growth_built") == gname and constituents:
+        prog = st.progress(0.0, text="Fetching constituent financials…")
+        funds = []
+        for i, sym in enumerate(constituents):
+            funds.append(gd.fetch_stock_fundamentals(sym))
+            if i % 3 == 0 or i == n_con - 1:
+                prog.progress((i + 1) / n_con, text=f"Fetched {i + 1}/{n_con} constituents")
+        prog.empty()
+
+        # Aggregate (sum) then compute growth — via the pure engine
+        agg = {k: ge.aggregate_periodic([f[k] for f in funds])
+               for k in ("revenue_q", "revenue_a", "pat_q", "pat_a")}
+        cov_rev = ge.coverage([f["revenue_q"] for f in funds])
+        cov_pat = ge.coverage([f["pat_q"] for f in funds])
+        rev = ge.metric_block(agg["revenue_q"], agg["revenue_a"])
+        pat = ge.metric_block(agg["pat_q"], agg["pat_a"])
+
+        if rev["current"] is None and pat["current"] is None:
+            data_notice("Growth data unavailable",
+                        "Couldn't assemble constituent financials for this index right now "
+                        "(yfinance may be rate-limiting). Try the button again, or Refresh.",
+                        kind="warn")
+        else:
+            CR = 1e7  # rupees → ₹ crore
+
+            def _pct(v):
+                return f"{v:+.2f}%" if v is not None else "—"
+
+            # ── Growth Overview cards ──
+            st.markdown("#### Growth Overview")
+            cc = st.columns(2)
+            for col, (label, blk) in zip(cc, [("Revenue (Topline)", rev), ("PAT / Aggregate Earnings", pat)]):
+                cur_cr = f"₹{blk['current'] / CR:,.0f} cr" if blk["current"] is not None else "—"
+                col.metric(f"{label} — latest qtr", cur_cr)
+                sub = col.columns(2)
+                sub[0].metric("YoY", _pct(blk["yoy"]))
+                sub[1].metric("QoQ", _pct(blk["qoq"]))
+            st.caption(
+                f"Coverage — Revenue: {cov_rev * 100:.0f}% of constituents · PAT: {cov_pat * 100:.0f}%. "
+                "Index EPS-growth equals aggregate-earnings (PAT) growth here (per-share normalisation "
+                "needs share-count history that isn't available)."
+            )
+
+            # ── Trend charts (quarterly + annual), lazily built only on demand ──
+            st.markdown("#### Trends")
+            for label, q, a, color in [("Revenue", agg["revenue_q"], agg["revenue_a"], "#22d3ee"),
+                                       ("PAT", agg["pat_q"], agg["pat_a"], "#a78bfa")]:
+                qs, as_ = ge._clean_series(q), ge._clean_series(a)
+                tcols = st.columns(2)
+                if not qs.empty:
+                    f1 = go.Figure(go.Bar(x=qs.index, y=qs.values / CR, marker_color=color))
+                    f1.update_layout(height=240, template="plotly_dark", margin=dict(l=0, r=0, t=28, b=0),
+                                     title=f"{label} — Quarterly (₹ cr)", showlegend=False,
+                                     plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+                    f1.update_xaxes(showgrid=False); f1.update_yaxes(showgrid=True, gridcolor="#232733")
+                    tcols[0].plotly_chart(f1, use_container_width=True, theme=None, config={"displayModeBar": False})
+                if not as_.empty:
+                    f2 = go.Figure(go.Bar(x=[d.year for d in as_.index], y=as_.values / CR, marker_color=color))
+                    f2.update_layout(height=240, template="plotly_dark", margin=dict(l=0, r=0, t=28, b=0),
+                                     title=f"{label} — Annual (₹ cr)", showlegend=False,
+                                     plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+                    f2.update_xaxes(showgrid=False); f2.update_yaxes(showgrid=True, gridcolor="#232733")
+                    tcols[1].plotly_chart(f2, use_container_width=True, theme=None, config={"displayModeBar": False})
+
+            # ── CAGR table ──
+            st.markdown("#### CAGR")
+
+            def _cg(v):
+                return f"{v:.2f}%" if v is not None else "—"
+
+            cagr_rows = ""
+            for name, b in [("Revenue", rev), ("PAT / Earnings", pat)]:
+                cagr_rows += (
+                    f"<tr><td>{name}</td>"
+                    f"<td class='cmp-num'>{_cg(b['cagr_3y'])}</td>"
+                    f"<td class='cmp-num'>{_cg(b['cagr_5y'])}</td></tr>"
+                )
+            st.markdown(
+                "<table class='cmp-table'><tr><th>Metric</th><th>3Y CAGR</th><th>5Y CAGR</th></tr>"
+                + cagr_rows + "</table>",
+                unsafe_allow_html=True,
+            )
+
+            # ── Growth heat-map (momentum: accelerating / stable / declining) ──
+            st.markdown("#### Growth Momentum")
+            _trend_style = {
+                "accelerating": ("🟢 Accelerating", "zone-under"),
+                "stable": ("🟡 Stable", "zone-fair"),
+                "declining": ("🔴 Declining", "zone-over"),
+            }
+            hcols = st.columns(2)
+            for col, (name, blk) in zip(hcols, [("Revenue", rev), ("PAT / Earnings", pat)]):
+                label, cls = _trend_style.get(blk["trend"], ("—", "zone-neutral"))
+                col.markdown(
+                    f"<div style='text-align:center;'><div class='hero-name'>{name}</div>"
+                    f"<span class='zone-badge {cls}' style='margin-top:6px;display:inline-block;'>{label}</span></div>",
+                    unsafe_allow_html=True,
+                )
+            st.caption("Momentum compares the latest YoY growth to the prior period's YoY growth.")
+
+            # ── Export ──
+            growth_export = {
+                "index": gname, "n_constituents": n_con,
+                "coverage": {"revenue": round(cov_rev, 3), "pat": round(cov_pat, 3)},
+                "generated_at_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "metrics": {"Revenue": rev, "PAT": pat},
+            }
+            # strip non-serialisable Series from metric_block before export
+            for mk in growth_export["metrics"].values():
+                mk.pop("series", None)
+            gx1, gx2 = st.columns(2)
+            gx1.download_button("⬇️ Growth metrics (JSON)",
+                                data=json.dumps(growth_export, indent=2, default=str).encode("utf-8"),
+                                file_name=f"{gname.replace(' ', '_')}_growth.json",
+                                mime="application/json", use_container_width=True)
+            flat = [{"metric": mn, "field": k, "value": v}
+                    for mn, blk in growth_export["metrics"].items() for k, v in blk.items()]
+            gx2.download_button("⬇️ Growth metrics (CSV)",
+                                data=pd.DataFrame(flat).to_csv(index=False).encode("utf-8"),
+                                file_name=f"{gname.replace(' ', '_')}_growth.csv",
+                                mime="text/csv", use_container_width=True)
 
     st.stop()
 
@@ -1798,7 +1960,7 @@ def _render_price_chart():
     fig.update_yaxes(showgrid=True, gridcolor="#232733", row=1, col=1)
     fig.update_yaxes(showgrid=True, gridcolor="#232733", row=2, col=1, title="Volume", title_font=dict(size=10))
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, theme=None, config={"displayModeBar": False})
 
     # Limited-history notice (indices Yahoo doesn't carry fall back to niftyindices,
     # which only reliably serves a short recent daily window).
@@ -1890,7 +2052,7 @@ with tab_ret:
             yaxis_title="Return (%)",
             showlegend=False,
         )
-        st.plotly_chart(ret_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(ret_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
     else:
         st.info("Not enough data to compute returns.")
 
@@ -1948,7 +2110,7 @@ with tab_val:
         )
         val_fig.update_xaxes(showgrid=False)
         val_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(val_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(val_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
 
         st.caption("Dashed line = 10-year mean. Current values: NSE · history: niftyindices.com")
     else:
@@ -2019,7 +2181,7 @@ with tab_tech:
         )
         ma_fig.update_xaxes(showgrid=False)
         ma_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(ma_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(ma_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
 
     # ── RSI (Relative Strength Index) — shown for every index ──
     section_header(
@@ -2066,7 +2228,7 @@ with tab_tech:
             )
             rsi_fig.update_xaxes(showgrid=False)
             rsi_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-            st.plotly_chart(rsi_fig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(rsi_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
     else:
         data_notice("RSI unavailable", "Not enough price history to compute RSI (needs > 14 sessions).", kind="muted")
 
@@ -2109,7 +2271,7 @@ with tab_tech:
         )
         fib_fig.update_xaxes(showgrid=False)
         fib_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(fib_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fib_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
 
         # Levels row
         lvl_cols = st.columns(len(fib["levels"]))
@@ -2182,7 +2344,7 @@ with tab_pct:
             ))
             gfig.update_layout(height=230, template="plotly_dark", margin=dict(l=20, r=20, t=20, b=0),
                                paper_bgcolor="rgba(0,0,0,0)", font={"color": "#e6e6e6"})
-            st.plotly_chart(gfig, use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(gfig, use_container_width=True, theme=None, config={"displayModeBar": False})
         with rcol:
             st.markdown("###### Percentile across market regimes")
             rk = st.columns(4)
@@ -2220,7 +2382,7 @@ with tab_pct:
                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
         dist_fig.update_xaxes(showgrid=False)
         dist_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(dist_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(dist_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
 
         # ── Time series with 5 / 50 / 95 percentile lines + current ──
         st.markdown("#### P/E Over Time with Percentile Bands")
@@ -2236,7 +2398,7 @@ with tab_pct:
                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
         band_fig.update_xaxes(showgrid=False)
         band_fig.update_yaxes(showgrid=True, gridcolor="#232733")
-        st.plotly_chart(band_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(band_fig, use_container_width=True, theme=None, config={"displayModeBar": False})
 
         # ── Same framework for P/B and Dividend Yield ──
         st.markdown("#### Other Valuation Metrics — percentile & band")
