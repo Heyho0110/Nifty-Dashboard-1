@@ -36,9 +36,6 @@ import requests
 import json
 import warnings
 
-import growth_engine as ge
-import growth_data as gd
-
 warnings.filterwarnings("ignore")
 
 # Make every plotly_dark figure blend with the dark app background regardless of the
@@ -403,11 +400,11 @@ def _fetch_pe_year(nifty_name: str, year: int) -> pd.DataFrame:
             }
         )
     }
-    for _ in range(3):  # retry — endpoint is intermittently slow/flaky
+    for _ in range(2):  # retry — endpoint is intermittently slow/flaky (fail fast; we have a fallback)
         try:
             session = requests.Session()
-            session.get(base, headers={"User-Agent": ua}, timeout=10)
-            r = session.post(url, headers=headers, json=payload, timeout=20)
+            session.get(base, headers={"User-Agent": ua}, timeout=8)
+            r = session.post(url, headers=headers, json=payload, timeout=12)
             if r.status_code != 200:
                 continue
             raw = r.json().get("d")
@@ -430,31 +427,86 @@ def _fetch_pe_year(nifty_name: str, year: int) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_pe_pb_data(nifty_name: str, years: int = 10) -> pd.DataFrame:
+def _fetch_pe_single(nifty_name: str, years: int = 10) -> pd.DataFrame:
     """
-    Historical PE / PB / Dividend Yield from niftyindices.com as a TRUE DAILY series.
-    Cached 24h: the 10-year daily stitch is ~10 slowish requests, and historical PE
-    is effectively immutable (only the latest EOD point appends) — so we pay the cost
-    at most once per index per day. Use the sidebar Refresh to force a fresh pull.
+    Resilient FALLBACK: one full-range request. niftyindices collapses this to a
+    sparse (~monthly) sample, but it's a single lightweight call that usually
+    succeeds even when the heavier per-year daily stitch is rate-limited. Lets the
+    valuation trend + percentile still render (monthly-basis) instead of vanishing.
+    """
+    base = "https://www.niftyindices.com"
+    url = f"{base}/Backpage.aspx/getpepbHistoricaldataDBtoString"
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+    headers = {
+        "User-Agent": ua, "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json; charset=UTF-8", "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{base}/reports/historical-data", "Origin": base,
+    }
+    end = datetime.now()
+    start = end - timedelta(days=365 * years)
+    payload = {"cinfo": json.dumps({
+        "name": nifty_name, "startDate": start.strftime("%d-%b-%Y"),
+        "endDate": end.strftime("%d-%b-%Y"), "indexName": nifty_name})}
+    for _ in range(2):
+        try:
+            session = requests.Session()
+            session.get(base, headers={"User-Agent": ua}, timeout=8)
+            r = session.post(url, headers=headers, json=payload, timeout=15)
+            if r.status_code != 200:
+                continue
+            raw = r.json().get("d")
+            records = json.loads(raw) if isinstance(raw, str) else raw
+            if not records:
+                continue
+            df = pd.DataFrame(records)
+            if "DATE" not in df.columns:
+                continue
+            df["Date"] = pd.to_datetime(df["DATE"], errors="coerce")
+            for src, dst in {"pe": "PE", "pb": "PB", "divYield": "DY"}.items():
+                if src in df.columns:
+                    df[dst] = pd.to_numeric(df[src], errors="coerce")
+            keep = ["Date"] + [c for c in ("PE", "PB", "DY") if c in df.columns]
+            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)[keep]
+            if not df.empty and "PE" in df.columns and not df["PE"].dropna().empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
 
-    Fetches each of the last `years` calendar years separately (concurrently) and
-    stitches them, because a single multi-year request collapses to one month per
-    year. The result is the full daily distribution (~2,200–2,500 points), so the
-    PE percentile is computed against every daily observation — not a month-specific
-    sample. Missing dates (weekends/holidays) are simply absent (no interpolation);
-    values are used as reported by NSE (any historical methodology change, e.g. the
-    standalone→consolidated shift, is left as-is rather than silently spliced).
-    Returns Date/PE/PB/DY sorted ascending, or empty if the index has no PE history.
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_pe_pb_data(nifty_name: str, years: int = 10, daily: bool = False) -> pd.DataFrame:
     """
+    Historical PE / PB / Dividend Yield from niftyindices.com.
+
+    daily=False (DEFAULT, lightweight): ONE full-range request. Fast and gentle on
+    niftyindices (a single call), so it's used on every index view. niftyindices
+    usually returns a dense series, occasionally a ~monthly sample — either way the
+    percentile is honest, just possibly coarser.
+
+    daily=True (opt-in "full daily"): fetch each of the last `years` calendar years
+    separately and stitch them into the guaranteed full daily distribution
+    (~2,200–2,500 points). Heavier (~10 requests) — only run on demand. Missing dates
+    are simply absent (no interpolation); values are used as reported by NSE.
+
+    Cached 24h per (index, daily). Returns Date/PE/PB/DY ascending, or empty if the
+    index has no PE history.
+    """
+    if not daily:
+        return _fetch_pe_single(nifty_name, years)
+
     current_year = datetime.now().year
     year_list = list(range(current_year - years + 1, current_year + 1))
 
-    # Probe the current year first: if it comes back empty, the index simply has no
-    # PE history (e.g. Smallcap 250) — return fast instead of retrying all 10 years.
+    # Probe the current year first. If empty, it's EITHER a no-PE index (e.g. Smallcap)
+    # OR niftyindices is throttling us — so try one lightweight full-range request
+    # before concluding there's no history.
     probe = _fetch_pe_year(nifty_name, current_year)
     if probe.empty:
-        return pd.DataFrame()
+        return _fetch_pe_single(nifty_name, years)
 
     # Fetch the remaining years concurrently (modest pool to avoid rate-limiting).
     rest_years = year_list[:-1]
@@ -465,9 +517,6 @@ def fetch_pe_pb_data(nifty_name: str, years: int = 10) -> pd.DataFrame:
         frames = [_fetch_pe_year(nifty_name, y) for y in rest_years]
 
     frames = [probe] + [f for f in frames if f is not None and not f.empty]
-    if not frames:
-        return pd.DataFrame()
-
     df = (
         pd.concat(frames, ignore_index=True)
         .dropna(subset=["Date"])
@@ -476,7 +525,13 @@ def fetch_pe_pb_data(nifty_name: str, years: int = 10) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     if df.empty or "PE" not in df.columns or df["PE"].dropna().empty:
-        return pd.DataFrame()
+        return _fetch_pe_single(nifty_name, years)
+    # If the daily stitch came back thin (most years throttled), supplement with the
+    # lightweight full-range sample so the percentile/trend still render.
+    if len(df) < 60:
+        alt = _fetch_pe_single(nifty_name, years)
+        if len(alt) > len(df):
+            return alt
     return df
 
 
@@ -1206,7 +1261,7 @@ def resample_ohlc(df, interval):
 
 view_mode = st.segmented_control(
     "View mode",
-    ["📊 Single", "⚖️ Compare", "🔁 Market", "📈 Growth"],
+    ["📊 Single", "⚖️ Compare", "🔁 Market"],
     default="📊 Single",
     label_visibility="collapsed",
 )
@@ -1589,163 +1644,14 @@ if view_mode and "Market" in view_mode:
     st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GROWTH VIEW — index/sector fundamental growth (aggregate constituents)
-# ═══════════════════════════════════════════════════════════════════════════
-if view_mode and "Growth" in view_mode:
-    st.markdown("### 📈 Growth Metrics — index & sector fundamentals")
-    src_badge("yfinance (constituent financials) · NSE (constituents)")
-
-    g_names = [n for n in ALL_NAMES if gd.has_constituents(INDEX_BY_NAME[n][2])]
-    cur_name = st.session_state.selected_index[0]
-    g_default = cur_name if cur_name in g_names else (g_names[0] if g_names else None)
-    gname = st.selectbox("Index / sector", g_names,
-                         index=(g_names.index(g_default) if g_default in g_names else 0),
-                         key="growth_idx")
-    g_ni = INDEX_BY_NAME[gname][2]
-    constituents = gd.fetch_constituents(g_ni)
-    n_con = len(constituents)
-    st.caption(
-        f"Aggregates the **{n_con} constituents** of {gname} — sums each metric across "
-        f"companies per period, then computes growth (never averages percentages). "
-        f"First build fetches every constituent's statements"
-        + (" — this is large, expect a minute+." if n_con > 120 else " (cached 24h).")
-    )
-
-    if st.button("📈 Build / refresh growth metrics", key="build_growth"):
-        st.session_state["_growth_built"] = gname
-
-    if st.session_state.get("_growth_built") == gname and constituents:
-        prog = st.progress(0.0, text="Fetching constituent financials…")
-        funds = []
-        for i, sym in enumerate(constituents):
-            funds.append(gd.fetch_stock_fundamentals(sym))
-            if i % 3 == 0 or i == n_con - 1:
-                prog.progress((i + 1) / n_con, text=f"Fetched {i + 1}/{n_con} constituents")
-        prog.empty()
-
-        # Aggregate (sum) then compute growth — via the pure engine
-        agg = {k: ge.aggregate_periodic([f[k] for f in funds])
-               for k in ("revenue_q", "revenue_a", "pat_q", "pat_a")}
-        cov_rev = ge.coverage([f["revenue_q"] for f in funds])
-        cov_pat = ge.coverage([f["pat_q"] for f in funds])
-        rev = ge.metric_block(agg["revenue_q"], agg["revenue_a"])
-        pat = ge.metric_block(agg["pat_q"], agg["pat_a"])
-
-        if rev["current"] is None and pat["current"] is None:
-            data_notice("Growth data unavailable",
-                        "Couldn't assemble constituent financials for this index right now "
-                        "(yfinance may be rate-limiting). Try the button again, or Refresh.",
-                        kind="warn")
-        else:
-            CR = 1e7  # rupees → ₹ crore
-
-            def _pct(v):
-                return f"{v:+.2f}%" if v is not None else "—"
-
-            # ── Growth Overview cards ──
-            st.markdown("#### Growth Overview")
-            cc = st.columns(2)
-            for col, (label, blk) in zip(cc, [("Revenue (Topline)", rev), ("PAT / Aggregate Earnings", pat)]):
-                cur_cr = f"₹{blk['current'] / CR:,.0f} cr" if blk["current"] is not None else "—"
-                col.metric(f"{label} — latest qtr", cur_cr)
-                sub = col.columns(2)
-                sub[0].metric("YoY", _pct(blk["yoy"]))
-                sub[1].metric("QoQ", _pct(blk["qoq"]))
-            st.caption(
-                f"Coverage — Revenue: {cov_rev * 100:.0f}% of constituents · PAT: {cov_pat * 100:.0f}%. "
-                "Index EPS-growth equals aggregate-earnings (PAT) growth here (per-share normalisation "
-                "needs share-count history that isn't available)."
-            )
-
-            # ── Trend charts (quarterly + annual), lazily built only on demand ──
-            st.markdown("#### Trends")
-            for label, q, a, color in [("Revenue", agg["revenue_q"], agg["revenue_a"], "#22d3ee"),
-                                       ("PAT", agg["pat_q"], agg["pat_a"], "#a78bfa")]:
-                qs, as_ = ge._clean_series(q), ge._clean_series(a)
-                tcols = st.columns(2)
-                if not qs.empty:
-                    f1 = go.Figure(go.Bar(x=qs.index, y=qs.values / CR, marker_color=color))
-                    f1.update_layout(height=240, template="plotly_dark", margin=dict(l=0, r=0, t=28, b=0),
-                                     title=f"{label} — Quarterly (₹ cr)", showlegend=False,
-                                     plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-                    f1.update_xaxes(showgrid=False); f1.update_yaxes(showgrid=True, gridcolor="#232733")
-                    tcols[0].plotly_chart(f1, use_container_width=True, theme=None, config={"displayModeBar": False})
-                if not as_.empty:
-                    f2 = go.Figure(go.Bar(x=[d.year for d in as_.index], y=as_.values / CR, marker_color=color))
-                    f2.update_layout(height=240, template="plotly_dark", margin=dict(l=0, r=0, t=28, b=0),
-                                     title=f"{label} — Annual (₹ cr)", showlegend=False,
-                                     plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-                    f2.update_xaxes(showgrid=False); f2.update_yaxes(showgrid=True, gridcolor="#232733")
-                    tcols[1].plotly_chart(f2, use_container_width=True, theme=None, config={"displayModeBar": False})
-
-            # ── CAGR table ──
-            st.markdown("#### CAGR")
-
-            def _cg(v):
-                return f"{v:.2f}%" if v is not None else "—"
-
-            cagr_rows = ""
-            for name, b in [("Revenue", rev), ("PAT / Earnings", pat)]:
-                cagr_rows += (
-                    f"<tr><td>{name}</td>"
-                    f"<td class='cmp-num'>{_cg(b['cagr_3y'])}</td>"
-                    f"<td class='cmp-num'>{_cg(b['cagr_5y'])}</td></tr>"
-                )
-            st.markdown(
-                "<table class='cmp-table'><tr><th>Metric</th><th>3Y CAGR</th><th>5Y CAGR</th></tr>"
-                + cagr_rows + "</table>",
-                unsafe_allow_html=True,
-            )
-
-            # ── Growth heat-map (momentum: accelerating / stable / declining) ──
-            st.markdown("#### Growth Momentum")
-            _trend_style = {
-                "accelerating": ("🟢 Accelerating", "zone-under"),
-                "stable": ("🟡 Stable", "zone-fair"),
-                "declining": ("🔴 Declining", "zone-over"),
-            }
-            hcols = st.columns(2)
-            for col, (name, blk) in zip(hcols, [("Revenue", rev), ("PAT / Earnings", pat)]):
-                label, cls = _trend_style.get(blk["trend"], ("—", "zone-neutral"))
-                col.markdown(
-                    f"<div style='text-align:center;'><div class='hero-name'>{name}</div>"
-                    f"<span class='zone-badge {cls}' style='margin-top:6px;display:inline-block;'>{label}</span></div>",
-                    unsafe_allow_html=True,
-                )
-            st.caption("Momentum compares the latest YoY growth to the prior period's YoY growth.")
-
-            # ── Export ──
-            growth_export = {
-                "index": gname, "n_constituents": n_con,
-                "coverage": {"revenue": round(cov_rev, 3), "pat": round(cov_pat, 3)},
-                "generated_at_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
-                "metrics": {"Revenue": rev, "PAT": pat},
-            }
-            # strip non-serialisable Series from metric_block before export
-            for mk in growth_export["metrics"].values():
-                mk.pop("series", None)
-            gx1, gx2 = st.columns(2)
-            gx1.download_button("⬇️ Growth metrics (JSON)",
-                                data=json.dumps(growth_export, indent=2, default=str).encode("utf-8"),
-                                file_name=f"{gname.replace(' ', '_')}_growth.json",
-                                mime="application/json", use_container_width=True)
-            flat = [{"metric": mn, "field": k, "value": v}
-                    for mn, blk in growth_export["metrics"].items() for k, v in blk.items()]
-            gx2.download_button("⬇️ Growth metrics (CSV)",
-                                data=pd.DataFrame(flat).to_csv(index=False).encode("utf-8"),
-                                file_name=f"{gname.replace(' ', '_')}_growth.csv",
-                                mime="text/csv", use_container_width=True)
-
-    st.stop()
-
-# ═══════════════════════════════════════════════════════════════════════════
 #  MAIN PAGE (Single)
 # ═══════════════════════════════════════════════════════════════════════════
 display_name, yf_ticker, ni_name = st.session_state.selected_index
 
 with st.spinner(f"Loading {display_name}…"):
     price_data = load_ohlcv(yf_ticker, ni_name, period="10y")
-    pe_data = fetch_pe_pb_data(ni_name, years=10)
+    # Lightweight (single-call) P/E by default; full daily stitch only when opted in.
+    pe_data = fetch_pe_pb_data(ni_name, years=10, daily=st.session_state.get("pe_full_daily", False))
 
 # Live P/E, P/B, Div Yield from NSE allIndices (authoritative current values).
 nse_pe, nse_pb, nse_dy = nse_valuation(ni_name)
@@ -2294,13 +2200,30 @@ with tab_tech:
 
 # ───── TAB 4: PE PERCENTILE ────────────────────────────────────────────────
 with tab_pct:
-    src_badge("NSE allIndices (current) · niftyindices (daily history)")
+    src_badge("NSE allIndices (current) · niftyindices (history)")
     section_header(
-        "P/E Percentile — full daily-history valuation engine",
-        "Live NSE P/E ranked against EVERY daily observation of the last 10 years "
-        "(% of days that were cheaper than today). Data-quality gate drops NaN/∞ and "
+        "P/E Percentile — historical valuation engine",
+        "Live NSE P/E ranked against the index's own historical P/E "
+        "(% of observations cheaper than today). Data-quality gate drops NaN/∞ and "
         "non-positive P/E before computing.",
     )
+
+    # Lightweight by default (one fast call); opt in to the heavier guaranteed full
+    # daily 10-year stitch. The choice is read at page load to fetch pe_data.
+    _full_daily = st.toggle(
+        "🔬 Use full daily 10-year history (slower, ~10 requests)",
+        key="pe_full_daily",
+        help="Default uses one lightweight request (fast, gentle on the data source). "
+             "Enable for the guaranteed full daily distribution — heavier and may be "
+             "rate-limited if used a lot.",
+    )
+    _n_obs = int(pe_data["PE"].dropna().shape[0]) if (not pe_data.empty and "PE" in pe_data.columns) else 0
+    st.caption(
+        ("**Full daily** basis — " if _full_daily else "**Lightweight** basis (single request) — ")
+        + f"{_n_obs:,} observations."
+        + ("" if _full_daily else " Toggle above for the guaranteed full daily distribution.")
+    )
+
     m = (valuation_metrics(pe_data["PE"], current=nse_pe)
          if (not pe_data.empty and "PE" in pe_data.columns) else None)
     if m:
