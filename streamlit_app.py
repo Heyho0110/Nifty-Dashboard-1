@@ -977,6 +977,7 @@ PE_NORM_TRANSITION_ANCHOR = "2021-03-31"  # documented NSE FY21 standalone→con
 PE_NORM_DETECT_WINDOW_DAYS = 25           # ± calendar days around the anchor to locate the exact break day
 PE_NORM_EST_WINDOW_DAYS = 25              # ± calendar days around the break used to estimate the factor
 PE_NORM_MIN_BREAK_JUMP = 0.04             # min |Δln(P/E)| (~4%) on the break day to qualify as a real break
+PE_NORM_WINDOW_LADDER = (25, 60, 120, 150)  # adaptive widening (days): start tight, widen if data is sparse/monthly
 PE_NORM_PB_CONTINUITY_TOL = 0.03          # |ΔP/B| below this ⇒ P/B continuous ⇒ use price-independent P/E÷P/B
 PE_NORM_IQR_K = 1.5                       # IQR multiplier for outlier fences (STEP 3)
 PE_NORM_CONF_HIGH = 0.06                  # rel-dispersion (std/median) thresholds for the confidence label
@@ -1005,13 +1006,24 @@ def detect_transition_break(df: pd.DataFrame, value_col: str = "PE",
     d = df.dropna(subset=[value_col]).sort_values("Date")
     d = d[d[value_col] > 0]
     a = pd.Timestamp(anchor)
-    lo = max(pd.Timestamp(start), a - pd.Timedelta(days=detect_days))
-    hi = min(pd.Timestamp(end), a + pd.Timedelta(days=detect_days))
-    win = d[(d["Date"] >= lo) & (d["Date"] <= hi)].copy()
-    if len(win) < 5:
-        log.info("break-detect: insufficient observations (%d) in [%s, %s]", len(win), lo.date(), hi.date())
+    # Adaptive window: start tight (precise on daily data) and widen only if the
+    # window is too sparse — so a monthly/sparse fetch still sees the month-to-month
+    # step. We look at the largest jump between CONSECUTIVE points, which works for
+    # both daily (single-day spike) and monthly (month-to-month step) series.
+    ladder = sorted(set([detect_days, *PE_NORM_WINDOW_LADDER]))
+    win = pd.DataFrame()
+    lo = hi = None
+    for w in ladder:
+        lo = max(pd.Timestamp(start), a - pd.Timedelta(days=w))
+        hi = min(pd.Timestamp(end), a + pd.Timedelta(days=w))
+        win = d[(d["Date"] >= lo) & (d["Date"] <= hi)].copy()
+        if len(win) >= 5:
+            break
+    if len(win) < 2:
+        log.info("break-detect: insufficient observations (%d) even at widest window [%s, %s]",
+                 len(win), lo.date() if lo else "?", hi.date() if hi else "?")
         return None, {"status": "insufficient_data", "n_in_window": int(len(win)),
-                      "search_window": [str(lo.date()), str(hi.date())]}
+                      "search_window": [str(lo.date()), str(hi.date())] if lo is not None else None}
     win["dln"] = np.log(win[value_col]).diff()
     idx = win["dln"].abs().idxmax()
     jump = float(win.loc[idx, "dln"])
@@ -1052,15 +1064,15 @@ def estimate_adjustment_factor(df: pd.DataFrame, break_date: pd.Timestamp,
     Returns a diagnostics dict (status "ok" carries the factor).
     """
     d = df.dropna(subset=["PE"]).sort_values("Date")
-    lo = break_date - pd.Timedelta(days=window_days)
-    hi = break_date + pd.Timedelta(days=window_days)
 
     # Adaptive basis: prefer the price-independent ratio when P/B did not itself jump.
+    # Compare the P/B values immediately bracketing the break (nearest point each side
+    # within 45d) so this works on daily AND sparse/monthly series.
     basis = "PE"
     pb_jump = None
     if "PB" in d.columns and (d["PB"] > 0).sum() > 10:
-        near = d[(d["Date"] >= break_date - pd.Timedelta(days=7)) &
-                 (d["Date"] <= break_date + pd.Timedelta(days=7))]
+        near = d[(d["Date"] >= break_date - pd.Timedelta(days=45)) &
+                 (d["Date"] <= break_date + pd.Timedelta(days=45))]
         pb_b = near[near["Date"] < break_date]["PB"].dropna()
         pb_a = near[near["Date"] >= break_date]["PB"].dropna()
         if len(pb_b) and len(pb_a) and pb_b.iloc[-1] > 0:
@@ -1070,12 +1082,21 @@ def estimate_adjustment_factor(df: pd.DataFrame, break_date: pd.Timestamp,
 
     src = (d["PE"] / d["PB"]) if basis == "PE/PB" else d["PE"]
     s = pd.DataFrame({"Date": d["Date"].values, "v": pd.to_numeric(src, errors="coerce").values}).dropna()
-    pre = s[(s["Date"] >= lo) & (s["Date"] < break_date)]["v"].values
-    post = s[(s["Date"] >= break_date) & (s["Date"] <= hi)]["v"].values
-    pre = pre[pre > 0]
-    post = post[post > 0]
-    if len(pre) < 3 or len(post) < 3:
-        log.info("factor-estimate: insufficient window obs (pre=%d, post=%d)", len(pre), len(post))
+    # Adaptive window: widen until both sides have enough points (handles sparse data).
+    ladder = sorted(set([window_days, *PE_NORM_WINDOW_LADDER]))
+    pre = post = np.array([])
+    for w in ladder:
+        lo = break_date - pd.Timedelta(days=w)
+        hi = break_date + pd.Timedelta(days=w)
+        pre = s[(s["Date"] >= lo) & (s["Date"] < break_date)]["v"].values
+        post = s[(s["Date"] >= break_date) & (s["Date"] <= hi)]["v"].values
+        pre = pre[pre > 0]
+        post = post[post > 0]
+        if len(pre) >= 3 and len(post) >= 3:
+            break
+    if len(pre) < 2 or len(post) < 2:
+        log.info("factor-estimate: insufficient window obs (pre=%d, post=%d) even at widest window",
+                 len(pre), len(post))
         return {"status": "insufficient_window_obs", "n_pre": int(len(pre)), "n_post": int(len(post)),
                 "basis": basis}
 
@@ -1818,16 +1839,27 @@ if view_mode and "Market" in view_mode:
     if st.session_state.get("_show_sector_val"):
         live_all = fetch_nse_indices()
         sectors = INDICES["Sectoral"]
+        # Honour the same Raw/Normalized basis chosen in the valuation tab, so the
+        # methodology-break normalization (with adaptive sparse-data detection) is
+        # applied to EVERY index here too — each gets its own per-index factor.
+        _sec_mode = st.session_state.get("pe_valuation_mode", "Raw")
         prog = st.progress(0.0, text="Fetching sector valuation history…")
         rows = []
         for i, (disp, _tk, ni) in enumerate(sectors):
             live_pe = (live_all.get(ni) or {}).get("pe")
             hist = fetch_pe_pb_data(ni, years=10)
-            pctile = median = None
-            if not hist.empty and "PE" in hist.columns and live_pe:
-                pctile = rolling_percentiles(hist, "PE", live_pe).get("10Y")
-                median = float(_clean_val_series(hist["PE"]).median())
-            rows.append((disp, live_pe, pctile, median))
+            pctile = median = factor = conf = None
+            if not hist.empty and "PE" in hist.columns:
+                # Run the normalization engine per-index (adds PE_raw + PE_normalized).
+                hist, _audit = build_normalized_pe_series(hist, value_col="PE")
+                _col = ("PE_normalized" if (_sec_mode == "Normalized" and "PE_normalized" in hist.columns)
+                        else "PE")
+                if _audit.get("normalized"):
+                    factor, conf = _audit.get("factor"), _audit.get("confidence")
+                if live_pe:
+                    pctile = rolling_percentiles(hist, _col, live_pe).get("10Y")
+                median = float(_clean_val_series(hist[_col]).median())
+            rows.append((disp, live_pe, pctile, median, factor, conf))
             prog.progress((i + 1) / len(sectors), text=f"Processed {disp}")
         prog.empty()
 
@@ -1838,9 +1870,13 @@ if view_mode and "Market" in view_mode:
             return f'<td class="cmp-num">{format(v, fmt)}</td>' if v is not None else '<td class="cmp-num">—</td>'
 
         body = []
-        for disp, live_pe, pctile, median in rows:
+        for disp, live_pe, pctile, median, factor, conf in rows:
             pe_cell = _c(live_pe, ".2f")
             med_cell = _c(median, ".2f")
+            if factor is not None:
+                fac_cell = f'<td class="cmp-num">×{factor:.3f}<br><span style="font-size:0.72rem;color:#9aa3b5;">{conf or ""}</span></td>'
+            else:
+                fac_cell = '<td class="cmp-num">—</td>'
             if pctile is not None:
                 z, zc = valuation_zone(pctile)
                 pct_cell = f'<td class="cmp-num">{pctile:.0f}%</td>'
@@ -1848,22 +1884,30 @@ if view_mode and "Market" in view_mode:
             else:
                 pct_cell = '<td class="cmp-num">—</td>'
                 zone_cell = '<td class="cmp-num">no history</td>'
-            body.append(f"<tr><td>{disp}</td>{pe_cell}{pct_cell}{med_cell}{zone_cell}</tr>")
+            body.append(f"<tr><td>{disp}</td>{pe_cell}{pct_cell}{med_cell}{fac_cell}{zone_cell}</tr>")
         st.markdown(
             '<table class="cmp-table"><tr><th>Sector</th><th>Current P/E</th>'
-            '<th>10Y %ile</th><th>Median P/E</th><th>Valuation zone</th></tr>'
+            '<th>10Y %ile</th><th>Median P/E</th><th>Adj. factor</th><th>Valuation zone</th></tr>'
             + "".join(body) + "</table>",
             unsafe_allow_html=True,
         )
-        st.caption("Percentile = % of the sector's last-10Y daily P/E readings below today's live NSE P/E.")
+        _basis_word = "Normalized" if _sec_mode == "Normalized" else "Raw"
+        st.caption(
+            f"Percentile = % of the sector's last-10Y daily P/E readings below today's live NSE P/E. "
+            f"Basis: **{_basis_word} P/E** (per-index methodology-break factors shown in *Adj. factor* — "
+            f"applied to the percentile only in Normalized mode; switch in the P/E Percentile tab)."
+        )
 
         # Export the sector table (CSV + JSON)
         sec_records = [
             {"sector": disp, "current_pe": live_pe,
              "pctile_10Y": (round(pctile, 1) if pctile is not None else None),
              "median_pe": (round(median, 2) if median is not None else None),
+             "pe_basis": ("normalized" if _sec_mode == "Normalized" else "raw"),
+             "adjustment_factor": (round(factor, 4) if factor is not None else None),
+             "normalization_confidence": conf,
              "zone": (valuation_zone(pctile)[0] if pctile is not None else None)}
-            for disp, live_pe, pctile, median in rows
+            for disp, live_pe, pctile, median, factor, conf in rows
         ]
         sec_csv = pd.DataFrame(sec_records).to_csv(index=False).encode("utf-8")
         sec_json = json.dumps({"generated_at_ist": ist_now().strftime("%Y-%m-%d %H:%M:%S"),
