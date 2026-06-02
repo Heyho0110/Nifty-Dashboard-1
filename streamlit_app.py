@@ -34,9 +34,15 @@ from concurrent.futures import ThreadPoolExecutor
 import streamlit.components.v1 as components
 import requests
 import json
+import logging
 import warnings
 
 warnings.filterwarnings("ignore")
+
+# Module logger — emits an audit trail for the P/E normalization engine (STEP 10).
+# Streamlit surfaces these on the server console; they are not shown to end users.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("nifty.pe_normalization")
 
 # Make every plotly_dark figure blend with the dark app background regardless of the
 # deploy environment. On Streamlit Cloud the Streamlit chart theme can otherwise
@@ -935,6 +941,229 @@ def rolling_percentiles(df: pd.DataFrame, value_col: str, current: float) -> dic
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  P/E NORMALIZATION ENGINE — methodology-break adjustment
+# ───────────────────────────────────────────────────────────────────────────
+#  WHY THIS EXISTS
+#  Around the close of FY2020-21, NSE/Nifty Indices switched the earnings basis
+#  of its valuation ratios (P/E, P/B, dividend yield) from STANDALONE to
+#  CONSOLIDATED earnings. The published historical P/E series SPLICES the two
+#  regimes with no back-adjustment: pre-transition values sit on a standalone
+#  basis, post-transition values on a consolidated basis. Ranking today's
+#  (consolidated) P/E against a window that mixes both regimes is not
+#  methodology-consistent.
+#
+#  WHAT THIS ENGINE DOES
+#  It produces a NORMALIZED, consolidated-equivalent history by scaling the
+#  pre-transition segment by an empirically derived multiplicative factor, while
+#  leaving all raw data untouched. It does NOT rebuild earnings from constituents.
+#
+#  IDENTIFICATION (important caveat)
+#  The data source exposes a single P/E per date — standalone and consolidated
+#  P/E are NEVER published simultaneously, so there is no true "overlap" sample.
+#  The adjustment factor is therefore identified from observations BRACKETING the
+#  transition (the discontinuity), not from simultaneous standalone/consolidated
+#  pairs. Where P/B is continuous across the break (book value largely unaffected),
+#  we use the price-independent ratio R = P/E ÷ P/B (= Book/Earnings), whose jump
+#  isolates the earnings-basis change and cancels any price drift in the window;
+#  R_post / R_pre = Standalone-EPS / Consolidated-EPS, exactly the adjustment
+#  factor. Where P/B ALSO shifted at the break, we fall back to raw P/E ratios over
+#  a tight window. The result is an approximation — see the dashboard methodology
+#  note and validation panel.
+# ═══════════════════════════════════════════════════════════════════════════
+# --- Configurable parameters (STEP 1) — adjust here, never hardcode downstream ---
+PE_NORM_TRANSITION_START = "2020-01-01"   # outer bound of the transition era to consider
+PE_NORM_TRANSITION_END = "2022-12-31"     # outer bound (inclusive)
+PE_NORM_TRANSITION_ANCHOR = "2021-03-31"  # documented NSE FY21 standalone→consolidated switch
+PE_NORM_DETECT_WINDOW_DAYS = 25           # ± calendar days around the anchor to locate the exact break day
+PE_NORM_EST_WINDOW_DAYS = 25              # ± calendar days around the break used to estimate the factor
+PE_NORM_MIN_BREAK_JUMP = 0.04             # min |Δln(P/E)| (~4%) on the break day to qualify as a real break
+PE_NORM_PB_CONTINUITY_TOL = 0.03          # |ΔP/B| below this ⇒ P/B continuous ⇒ use price-independent P/E÷P/B
+PE_NORM_IQR_K = 1.5                       # IQR multiplier for outlier fences (STEP 3)
+PE_NORM_CONF_HIGH = 0.06                  # rel-dispersion (std/median) thresholds for the confidence label
+PE_NORM_CONF_MODERATE = 0.15
+
+
+def detect_transition_break(df: pd.DataFrame, value_col: str = "PE",
+                            anchor: str = PE_NORM_TRANSITION_ANCHOR,
+                            detect_days: int = PE_NORM_DETECT_WINDOW_DAYS,
+                            start: str = PE_NORM_TRANSITION_START,
+                            end: str = PE_NORM_TRANSITION_END) -> tuple:
+    """
+    STEP 1 — locate the methodology transition day.
+
+    The transition is a documented, system-wide event (FY21 boundary, identical
+    date across every index). Rather than taking the global maximum jump over the
+    whole 2020-2022 window — which would catch COVID earnings-revision spikes — we
+    ANCHOR on the documented date and snap to the largest single-day |Δln(P/E)|
+    within ±detect_days of it. Anchor + window are both configurable, so the engine
+    is reusable for any future methodology change or other instruments.
+
+    Returns (break_timestamp | None, diagnostics_dict).
+    """
+    if df is None or df.empty or value_col not in df.columns or "Date" not in df.columns:
+        return None, {"status": "no_data"}
+    d = df.dropna(subset=[value_col]).sort_values("Date")
+    d = d[d[value_col] > 0]
+    a = pd.Timestamp(anchor)
+    lo = max(pd.Timestamp(start), a - pd.Timedelta(days=detect_days))
+    hi = min(pd.Timestamp(end), a + pd.Timedelta(days=detect_days))
+    win = d[(d["Date"] >= lo) & (d["Date"] <= hi)].copy()
+    if len(win) < 5:
+        log.info("break-detect: insufficient observations (%d) in [%s, %s]", len(win), lo.date(), hi.date())
+        return None, {"status": "insufficient_data", "n_in_window": int(len(win)),
+                      "search_window": [str(lo.date()), str(hi.date())]}
+    win["dln"] = np.log(win[value_col]).diff()
+    idx = win["dln"].abs().idxmax()
+    jump = float(win.loc[idx, "dln"])
+    bdate = win.loc[idx, "Date"]
+    if abs(jump) < PE_NORM_MIN_BREAK_JUMP:
+        log.info("break-detect: largest jump %.3f%% below threshold — treating as no break",
+                 (np.exp(jump) - 1) * 100)
+        return None, {"status": "no_significant_break", "max_jump_pct": float(np.exp(jump) - 1),
+                      "search_window": [str(lo.date()), str(hi.date())]}
+    log.info("break-detect: break at %s (%.1f%% one-day P/E move)", bdate.date(), (np.exp(jump) - 1) * 100)
+    return bdate, {"status": "detected", "break_date": str(bdate.date()),
+                   "jump_pct": float(np.exp(jump) - 1),
+                   "search_window": [str(lo.date()), str(hi.date())]}
+
+
+def estimate_adjustment_factor(df: pd.DataFrame, break_date: pd.Timestamp,
+                               window_days: int = PE_NORM_EST_WINDOW_DAYS,
+                               iqr_k: float = PE_NORM_IQR_K) -> dict:
+    """
+    STEPS 2-4 — robustly estimate the adjustment factor at the break.
+
+    Adjustment factor = P/E_consolidated ÷ P/E_standalone  ( = Standalone-EPS ÷
+    Consolidated-EPS ). Pre-transition P/E is multiplied by this to reach a
+    consolidated-equivalent level.
+
+    Method:
+      • Choose a price-independent basis when valid: if P/B is continuous across the
+        break (|ΔP/B| < tol), use R = P/E ÷ P/B; otherwise use raw P/E over a tight
+        window (price drift then small).
+      • Build the factor-observation CLOUD as every post-break value ÷ every
+        pre-break value within ±window_days (a Hodges-Lehmann-style two-sample ratio
+        set). This yields many observations for the outlier/robust-stat machinery.
+      • STEP 3 outlier removal: drop observations outside [Q1-k·IQR, Q3+k·IQR].
+      • STEP 4 robust estimate: report median (production factor), mean, std, min,
+        max, counts. The MEDIAN is used downstream — resistant to COVID distortions,
+        one-off subsidiary gains/losses and reporting anomalies.
+
+    Returns a diagnostics dict (status "ok" carries the factor).
+    """
+    d = df.dropna(subset=["PE"]).sort_values("Date")
+    lo = break_date - pd.Timedelta(days=window_days)
+    hi = break_date + pd.Timedelta(days=window_days)
+
+    # Adaptive basis: prefer the price-independent ratio when P/B did not itself jump.
+    basis = "PE"
+    pb_jump = None
+    if "PB" in d.columns and (d["PB"] > 0).sum() > 10:
+        near = d[(d["Date"] >= break_date - pd.Timedelta(days=7)) &
+                 (d["Date"] <= break_date + pd.Timedelta(days=7))]
+        pb_b = near[near["Date"] < break_date]["PB"].dropna()
+        pb_a = near[near["Date"] >= break_date]["PB"].dropna()
+        if len(pb_b) and len(pb_a) and pb_b.iloc[-1] > 0:
+            pb_jump = float(pb_a.iloc[0] / pb_b.iloc[-1] - 1)
+            if abs(pb_jump) < PE_NORM_PB_CONTINUITY_TOL:
+                basis = "PE/PB"
+
+    src = (d["PE"] / d["PB"]) if basis == "PE/PB" else d["PE"]
+    s = pd.DataFrame({"Date": d["Date"].values, "v": pd.to_numeric(src, errors="coerce").values}).dropna()
+    pre = s[(s["Date"] >= lo) & (s["Date"] < break_date)]["v"].values
+    post = s[(s["Date"] >= break_date) & (s["Date"] <= hi)]["v"].values
+    pre = pre[pre > 0]
+    post = post[post > 0]
+    if len(pre) < 3 or len(post) < 3:
+        log.info("factor-estimate: insufficient window obs (pre=%d, post=%d)", len(pre), len(post))
+        return {"status": "insufficient_window_obs", "n_pre": int(len(pre)), "n_post": int(len(post)),
+                "basis": basis}
+
+    cloud = (post[:, None] / pre[None, :]).ravel()  # all pairwise consolidated÷standalone ratios
+    n_total = int(cloud.size)
+    # STEP 3 — IQR outlier removal
+    q1, q3 = np.percentile(cloud, [25, 75])
+    iqr = q3 - q1
+    lob, hib = q1 - iqr_k * iqr, q3 + iqr_k * iqr
+    kept = cloud[(cloud >= lob) & (cloud <= hib)]
+    if kept.size == 0:
+        kept = cloud
+    n_used = int(kept.size)
+    n_removed = n_total - n_used
+    median = float(np.median(kept))
+    rel_disp = float(kept.std() / median) if median else None
+    log.info("factor-estimate: basis=%s factor(median)=%.4f obs=%d removed=%d reldisp=%.3f",
+             basis, median, n_total, n_removed, rel_disp or 0.0)
+    return {
+        "status": "ok", "basis": basis, "pb_jump_pct": pb_jump,
+        "factor": median, "median": median, "mean": float(kept.mean()), "std": float(kept.std()),
+        "min": float(kept.min()), "max": float(kept.max()),
+        "n_total": n_total, "n_removed": n_removed, "n_used": n_used,
+        "n_pre": int(len(pre)), "n_post": int(len(post)), "rel_dispersion": rel_disp,
+        "q1": float(q1), "q3": float(q3), "iqr_lower": float(lob), "iqr_upper": float(hib),
+    }
+
+
+def build_normalized_pe_series(df: pd.DataFrame, value_col: str = "PE", **cfg) -> tuple:
+    """
+    STEP 5 — produce the normalized, consolidated-equivalent P/E series.
+
+    Preserves the raw column as `<value_col>_raw` and adds `<value_col>_normalized`
+    (derived only — raw data is never modified). Pre-transition rows are scaled by
+    the median adjustment factor; post-transition rows are copied through unchanged.
+    Vectorized. Graceful no-op (normalized == raw) when no break is found or data is
+    insufficient, so every index — including those with no transition — keeps working.
+
+    Returns (dataframe_with_derived_columns, audit_dict). The audit dict carries the
+    full diagnostics required by the validation panel (STEP 9).
+    """
+    raw_col = f"{value_col}_raw"
+    norm_col = f"{value_col}_normalized"
+    ts = ist_now().strftime("%Y-%m-%d %H:%M:%S IST")
+
+    if df is None or df.empty or value_col not in df.columns:
+        out = df.copy() if df is not None else pd.DataFrame()
+        return out, {"normalized": False, "status": "no_data", "factor": 1.0, "timestamp": ts,
+                     "transition_window": [PE_NORM_TRANSITION_START, PE_NORM_TRANSITION_END]}
+
+    out = df.copy()
+    out[raw_col] = out[value_col]  # STEP 4/10 — preserve raw, create derived only
+
+    bdate, detect = detect_transition_break(out, value_col=value_col,
+                                            anchor=cfg.get("anchor", PE_NORM_TRANSITION_ANCHOR),
+                                            detect_days=cfg.get("detect_days", PE_NORM_DETECT_WINDOW_DAYS),
+                                            start=cfg.get("start", PE_NORM_TRANSITION_START),
+                                            end=cfg.get("end", PE_NORM_TRANSITION_END))
+    base_audit = {"timestamp": ts, "value_col": value_col, "detect": detect,
+                  "transition_window": [cfg.get("start", PE_NORM_TRANSITION_START),
+                                        cfg.get("end", PE_NORM_TRANSITION_END)]}
+    if bdate is None:
+        out[norm_col] = out[value_col]  # identity — no comparable break to adjust
+        log.info("normalize[%s]: no transition break — normalized series == raw", value_col)
+        return out, {**base_audit, "normalized": False, "factor": 1.0,
+                     "status": detect.get("status", "no_break")}
+
+    est = estimate_adjustment_factor(out, bdate, window_days=cfg.get("est_days", PE_NORM_EST_WINDOW_DAYS),
+                                     iqr_k=cfg.get("iqr_k", PE_NORM_IQR_K))
+    if est.get("status") != "ok":
+        out[norm_col] = out[value_col]
+        return out, {**base_audit, "normalized": False, "factor": 1.0,
+                     "break_date": str(bdate.date()), "estimate": est, "status": est.get("status")}
+
+    factor = est["factor"]
+    # STEP 5 — vectorized application: scale pre-transition, pass through post-transition.
+    out[norm_col] = np.where(out["Date"] < bdate, out[value_col] * factor, out[value_col])
+
+    rel = est.get("rel_dispersion") or 1.0
+    confidence = ("high" if rel < PE_NORM_CONF_HIGH
+                  else "moderate" if rel < PE_NORM_CONF_MODERATE else "low")
+    log.info("normalize[%s]: applied factor %.4f to pre-%s rows (confidence=%s)",
+             value_col, factor, bdate.date(), confidence)
+    return out, {**base_audit, "normalized": True, "factor": factor, "break_date": str(bdate.date()),
+                 "estimate": est, "confidence": confidence, "status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  UI HELPERS — status strip · badges · notices · glossary · animated hero
 # ═══════════════════════════════════════════════════════════════════════════
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -1079,6 +1308,10 @@ st.sidebar.caption("Tap any tile to open its dashboard")
 
 if "selected_index" not in st.session_state:
     st.session_state.selected_index = ("NIFTY 50", "^NSEI", "NIFTY 50")
+
+# P/E valuation basis: "Raw" (as-reported by NSE) or "Normalized" (methodology-break
+# adjusted). Default Raw so existing behaviour is unchanged until the user opts in.
+st.session_state.setdefault("pe_valuation_mode", "Raw")
 
 
 def _refresh_data():
@@ -1653,6 +1886,14 @@ with st.spinner(f"Loading {display_name}…"):
     # Lightweight (single-call) P/E by default; full daily stitch only when opted in.
     pe_data = fetch_pe_pb_data(ni_name, years=10, daily=st.session_state.get("pe_full_daily", False))
 
+# Build the methodology-normalized P/E series (adds PE_raw + PE_normalized; raw is
+# preserved). Cheap & vectorized, so computed every run. The audit dict feeds the
+# validation panel. `pe_value_col` is the column every P/E analytic reads, switched
+# by the Raw/Normalized toggle in the valuation tab.
+pe_data, pe_norm_audit = build_normalized_pe_series(pe_data, value_col="PE")
+_pe_mode = st.session_state.get("pe_valuation_mode", "Raw")
+pe_value_col = "PE_normalized" if (_pe_mode == "Normalized" and "PE_normalized" in pe_data.columns) else "PE"
+
 # Live P/E, P/B, Div Yield from NSE allIndices (authoritative current values).
 nse_pe, nse_pb, nse_dy = nse_valuation(ni_name)
 
@@ -1682,15 +1923,18 @@ with hero_col_left:
     )
 
 with hero_col_right:
-    # Quick valuation snapshot — live NSE P/E ranked against the daily NSE history
-    if not pe_data.empty and "PE" in pe_data.columns:
-        pe_now, pe_pct, _ = pe_percentile(pe_data["PE"], current=nse_pe)
+    # Quick valuation snapshot — live NSE P/E ranked against the daily NSE history.
+    # Honours the Raw/Normalized basis chosen in the valuation tab; the live (always
+    # consolidated) P/E remains the ranked value in both modes.
+    if not pe_data.empty and pe_value_col in pe_data.columns:
+        pe_now, pe_pct, _ = pe_percentile(pe_data[pe_value_col], current=nse_pe)
         if pe_now is not None:
             zone_txt, zone_cls = valuation_zone(pe_pct)
+            _basis_tag = "normalized" if pe_value_col == "PE_normalized" else "raw"
             st.markdown(
                 f"""
                 <div style="text-align:right; padding-top: 0.5rem;">
-                    <div class="hero-name">P/E (10Y percentile)</div>
+                    <div class="hero-name">P/E (10Y percentile · {_basis_tag})</div>
                     <div style="font-size: 1.8rem; font-weight: 700;">{pe_now:.2f}</div>
                     <div style="margin-top: 6px;">
                         <span class="zone-badge {zone_cls}">{zone_txt}</span>
@@ -2208,6 +2452,50 @@ with tab_pct:
         "non-positive P/E before computing.",
     )
 
+    # ── STEP 7: Raw ⟷ Normalized basis toggle ──
+    # Drives EVERY P/E analytic below (percentile, gauge, rolling windows, stats,
+    # distribution, band chart, export) via `pe_value_col`, recomputed at page top.
+    _norm_ok = bool(pe_norm_audit.get("normalized"))
+    mode_col, badge_col = st.columns([2, 3])
+    with mode_col:
+        st.radio(
+            "P/E basis",
+            ["Raw", "Normalized"],
+            key="pe_valuation_mode",
+            horizontal=True,
+            help="**Raw** — P/E exactly as reported by NSE (standalone basis before the "
+                 "FY21 transition, consolidated after).\n\n**Normalized** — pre-transition "
+                 "history scaled to a consolidated-equivalent basis using an empirically "
+                 "derived adjustment factor, so the full window is methodology-consistent.",
+        )
+    with badge_col:
+        if _norm_ok:
+            _conf = pe_norm_audit.get("confidence", "—")
+            _conf_cls = {"high": "zone-under", "moderate": "zone-fair", "low": "zone-over"}.get(_conf, "zone-neutral")
+            st.markdown(
+                f'<div style="padding-top:1.9rem;">'
+                f'<span class="zone-badge {_conf_cls}">factor ×{pe_norm_audit["factor"]:.3f} · '
+                f'break {pe_norm_audit.get("break_date")} · {_conf} confidence</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="padding-top:1.9rem;"><span class="zone-badge zone-neutral">'
+                'No methodology break detected — Normalized ≡ Raw</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    # STEP 8 — methodology disclosure (shown when the normalized basis is in effect).
+    if pe_value_col == "PE_normalized" and _norm_ok:
+        st.info(
+            "**Normalized P/E methodology.** Historical P/E values prior to the NSE earnings "
+            "methodology transition have been normalized using a median adjustment factor derived "
+            "from overlapping standalone and consolidated valuation observations. This adjustment "
+            "improves comparability across time but should be considered an approximation rather "
+            "than a full historical earnings restatement.",
+            icon="ℹ️",
+        )
+
     # Lightweight by default (one fast call); opt in to the heavier guaranteed full
     # daily 10-year stitch. The choice is read at page load to fetch pe_data.
     _full_daily = st.toggle(
@@ -2217,18 +2505,21 @@ with tab_pct:
              "Enable for the guaranteed full daily distribution — heavier and may be "
              "rate-limited if used a lot.",
     )
-    _n_obs = int(pe_data["PE"].dropna().shape[0]) if (not pe_data.empty and "PE" in pe_data.columns) else 0
+    _n_obs = int(pe_data[pe_value_col].dropna().shape[0]) if (not pe_data.empty and pe_value_col in pe_data.columns) else 0
+    _basis_word = "Normalized" if pe_value_col == "PE_normalized" else "Raw"
     st.caption(
         ("**Full daily** basis — " if _full_daily else "**Lightweight** basis (single request) — ")
-        + f"{_n_obs:,} observations."
+        + f"{_n_obs:,} observations · **{_basis_word} P/E**."
         + ("" if _full_daily else " Toggle above for the guaranteed full daily distribution.")
     )
 
-    m = (valuation_metrics(pe_data["PE"], current=nse_pe)
-         if (not pe_data.empty and "PE" in pe_data.columns) else None)
+    # All P/E analytics below read `pe_value_col` (Raw or Normalized). The ranked
+    # `current` is always the live consolidated NSE P/E in both modes.
+    m = (valuation_metrics(pe_data[pe_value_col], current=nse_pe)
+         if (not pe_data.empty and pe_value_col in pe_data.columns) else None)
     if m:
         zone_txt, zone_cls = valuation_zone(m["raw_pct"])
-        roll = rolling_percentiles(pe_data, "PE", m["current"])
+        roll = rolling_percentiles(pe_data, pe_value_col, m["current"])
 
         # ── Current valuation + zone ──
         p1, p2, p3 = st.columns([1, 1, 2])
@@ -2245,6 +2536,63 @@ with tab_pct:
             f"Based on **{m['n']:,} daily observations** · as of {pe_data['Date'].max():%b %d, %Y}. "
             f"Winsorized percentile (1% tails capped): **{m['wins_pct']:.1f}%**."
         )
+
+        # ── STEP 9: NORMALIZATION VALIDATION PANEL ──
+        # Always show the raw-vs-normalized comparison + audit metrics so the
+        # adjustment is fully transparent (and its uncertainty visible).
+        with st.expander("🔎 Normalization validation & audit", expanded=(pe_value_col == "PE_normalized")):
+            _m_raw = valuation_metrics(pe_data["PE"], current=nse_pe) if "PE" in pe_data.columns else None
+            _m_norm = (valuation_metrics(pe_data["PE_normalized"], current=nse_pe)
+                       if "PE_normalized" in pe_data.columns else None)
+            if not pe_norm_audit.get("normalized"):
+                st.caption(
+                    "No methodology break was detected for this index within the configured "
+                    f"transition window ({pe_norm_audit.get('transition_window')}), so the normalized "
+                    "series is identical to the raw series. Reason: "
+                    f"`{pe_norm_audit.get('status')}`."
+                )
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                st.markdown("###### Before normalization (raw)")
+                if _m_raw:
+                    st.metric("Mean P/E", f"{_m_raw['mean']:.2f}")
+                    st.metric("Median P/E", f"{_m_raw['median']:.2f}")
+                    st.metric("Current P/E percentile", f"{_m_raw['raw_pct']:.1f}%")
+            with vc2:
+                st.markdown("###### After normalization")
+                if _m_norm:
+                    _d_mean = _m_norm["mean"] - (_m_raw["mean"] if _m_raw else _m_norm["mean"])
+                    _d_med = _m_norm["median"] - (_m_raw["median"] if _m_raw else _m_norm["median"])
+                    _d_pct = _m_norm["raw_pct"] - (_m_raw["raw_pct"] if _m_raw else _m_norm["raw_pct"])
+                    st.metric("Mean P/E", f"{_m_norm['mean']:.2f}", delta=f"{_d_mean:+.2f}")
+                    st.metric("Median P/E", f"{_m_norm['median']:.2f}", delta=f"{_d_med:+.2f}")
+                    st.metric("Current P/E percentile", f"{_m_norm['raw_pct']:.1f}%",
+                              delta=f"{_d_pct:+.1f} pts", delta_color="off")
+
+            _est = pe_norm_audit.get("estimate", {}) or {}
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Adjustment factor", f"×{pe_norm_audit.get('factor', 1.0):.4f}")
+            a1.caption(f"Basis: `{_est.get('basis', 'n/a')}` · confidence: "
+                       f"**{pe_norm_audit.get('confidence', '—')}**")
+            a2.metric("Factor observations", f"{_est.get('n_used', 0):,}")
+            a2.caption(f"Outliers removed (IQR): **{_est.get('n_removed', 0):,}** of "
+                       f"{_est.get('n_total', 0):,}")
+            a3.metric("Transition / break", f"{pe_norm_audit.get('break_date', '—')}")
+            a3.caption(f"Window: {pe_norm_audit.get('transition_window', '—')}")
+            if _est.get("status") == "ok":
+                st.caption(
+                    f"Factor stats — median **{_est['median']:.4f}** · mean {_est['mean']:.4f} · "
+                    f"std {_est['std']:.4f} · range [{_est['min']:.4f}, {_est['max']:.4f}] · "
+                    f"rel-dispersion {(_est.get('rel_dispersion') or 0):.3f}. "
+                    f"Computed {pe_norm_audit.get('timestamp', '')}."
+                )
+            if pe_norm_audit.get("confidence") == "low":
+                st.warning(
+                    "⚠️ Low-confidence factor — wide dispersion across the transition window "
+                    "(typically COVID-distorted or subsidiary-heavy indices). Treat the normalized "
+                    "percentile as indicative only.",
+                    icon="⚠️",
+                )
 
         # ── Percentile gauge + rolling-window percentiles ──
         gcol, rcol = st.columns([1, 1])
@@ -2310,7 +2658,7 @@ with tab_pct:
         # ── Time series with 5 / 50 / 95 percentile lines + current ──
         st.markdown("#### P/E Over Time with Percentile Bands")
         band_fig = go.Figure()
-        band_fig.add_trace(go.Scatter(x=pe_data["Date"], y=pe_data["PE"],
+        band_fig.add_trace(go.Scatter(x=pe_data["Date"], y=pe_data[pe_value_col],
                                       line=dict(color="#6366f1", width=1.4), name="P/E"))
         band_fig.add_hline(y=m["pcts"][95], line_dash="dash", line_color="#ef4444", annotation_text="95th %ile")
         band_fig.add_hline(y=m["pcts"][50], line_dash="dash", line_color="#22c55e", annotation_text="Median")
@@ -2377,6 +2725,18 @@ with tab_pct:
             "source": "current value: NSE allIndices · daily history: niftyindices (NSE)",
             "methodology": ("percentile = % of daily historical observations strictly below the "
                             "current value, over full daily history; NaN/±inf/non-positive removed"),
+            "pe_basis": ("normalized" if pe_value_col == "PE_normalized" else "raw"),
+            # Full audit of the methodology-break normalization (STEP 9 export).
+            "pe_normalization": {
+                "applied": pe_value_col == "PE_normalized",
+                "break_detected": bool(pe_norm_audit.get("normalized")),
+                "adjustment_factor": round(float(pe_norm_audit.get("factor", 1.0)), 6),
+                "break_date": pe_norm_audit.get("break_date"),
+                "confidence": pe_norm_audit.get("confidence"),
+                "transition_window": pe_norm_audit.get("transition_window"),
+                "factor_stats": pe_norm_audit.get("estimate"),
+                "status": pe_norm_audit.get("status"),
+            },
             "metrics": {
                 "PE": _metric_export(m, roll),
                 "PB": _metric_export(mb, rb),
